@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: async_order
+      POSTGRES_USER: async_order
+      POSTGRES_PASSWORD: local_postgres_password
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: async_order
+      RABBITMQ_DEFAULT_PASS: local_rabbitmq_password
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  postgres_data:
+  rabbitmq_data:

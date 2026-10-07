@@ -13,6 +13,9 @@ describe('CreateOrderUseCase request context', () => {
   const orders = {
     lookUpIdempotence: jest.fn(),
     createOrder: jest.fn(),
+    findById: jest.fn(),
+    findAll: jest.fn(),
+    cancelPending: jest.fn(),
   };
   const accounts = { findById: jest.fn() };
   const publisher = { publish: jest.fn() };

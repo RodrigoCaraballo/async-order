@@ -1262,8 +1262,10 @@ including conflicts detected by PostgreSQL during insertion. The global
 code returns a generic 500; existing Nest exceptions retain their responses.
 An account that does not exist returns 404 with `Provided account does not exist`.
 
-The following get, list, and cancel contracts are planned; only create-order is
-currently implemented.
+Create, get, list, and cancel endpoints are implemented. Get, list, and cancel
+require the temporary `X-User-Id: <UUID>` header. This is caller-supplied identity,
+not authentication; production authorization must derive it from authenticated
+context. These operations filter by user ID at the repository boundary.
 
 ---
 
@@ -1288,13 +1290,18 @@ Response:
 
 `processingStep` is returned by the API in this project so the current durable workflow checkpoint can be inspected.
 
+Returns 200 for an accessible order, 404 for an absent order or one belonging to
+another user, and 400 for missing/invalid user UUID or invalid order UUID.
+The response omits `idempotencyKey` and converts PostgreSQL's numeric amount to
+a JSON number.
+
 ---
 
 ## List Orders
 
 `GET /orders`
 
-Potential query parameters:
+Optional query parameters (`page=1` and `limit=20` by default):
 
 ```text
 ?page=1
@@ -1314,6 +1321,10 @@ Response:
 ```
 
 The result must contain only orders belonging to the requesting user.
+The implementation filters by `X-User-Id` and optional uppercase status, sorts
+by `createdAt DESC, id DESC`, and uses offset pagination. Page must be a positive
+safe integer, and limit must be between 1 and 100; malformed values return 400.
+`total` is the count matching the user and optional status, before pagination.
 
 ---
 
@@ -1347,6 +1358,13 @@ Response:
 
 If the worker has already successfully transitioned the order to `PROCESSING`, cancellation must be rejected.
 
+The current endpoint returns 200 on success, 404 for an absent or inaccessible
+order, and 409 when the order no longer meets the pending conditions (including
+repeat cancellation). It performs one conditional UPDATE including order ID,
+user ID, `PENDING`, and `PENDING_CREATED`, changing status and step together.
+If no row changes, a user-scoped lookup distinguishes 404 from 409. No RabbitMQ
+message is published for cancellation.
+
 The implementation must correctly handle the race condition between:
 
 ```text
@@ -1360,3 +1378,6 @@ PENDING_CREATED -> PROCESSING_STARTED
 ```
 
 Only one transition may succeed.
+The future worker must also claim an order through a conditional transition
+from `PENDING` and `PENDING_CREATED`; cancellation cannot protect against a
+worker that overwrites status without checking its previous value.

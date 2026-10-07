@@ -3,6 +3,9 @@ import {
   CreateOrder,
   Order,
   OrderStatus,
+  OrderProcessingSteps,
+  ListOrdersQuery,
+  OrderPage,
 } from '../../domain/interfaces/order/order.interface';
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -53,5 +56,37 @@ export class OrderTypeOrmRepository implements IOrderRepository {
       idempotencyKey,
       status: In([OrderStatus.PENDING, OrderStatus.PROCESSING]),
     });
+  }
+
+  findById(id: string, userId: string): Promise<Order | null> {
+    return this.repository.findOneBy({ id, userId });
+  }
+
+  async findAll(userId: string, query: ListOrdersQuery): Promise<OrderPage> {
+    const [items, total] = await this.repository.findAndCount({
+      where: { userId, ...(query.status ? { status: query.status } : {}) },
+      order: { createdAt: 'DESC', id: 'DESC' },
+      skip: (query.page - 1) * query.limit,
+      take: query.limit,
+    });
+    return { items, total, page: query.page, limit: query.limit };
+  }
+
+  async cancelPending(id: string, userId: string): Promise<boolean> {
+    // The condition and transition happen in one UPDATE, so a concurrent worker
+    // that already claimed the order prevents cancellation.
+    const result = await this.repository.update(
+      {
+        id,
+        userId,
+        status: OrderStatus.PENDING,
+        processingStep: OrderProcessingSteps.PENDING_CREATED,
+      },
+      {
+        status: OrderStatus.CANCELED,
+        processingStep: OrderProcessingSteps.CANCELLED_BY_USER,
+      },
+    );
+    return result.affected === 1;
   }
 }

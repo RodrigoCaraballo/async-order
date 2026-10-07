@@ -2,7 +2,7 @@
 
 ## Overview
 Async Order is a backend service for managing orders that are processed asynchronously.
-Order creation is implemented. Querying, listing, cancellation, and worker processing remain part of the planned scope.
+Order creation, querying, listing, and cancellation are implemented. Worker processing remains part of the planned scope.
 The main goal of this project is to explore reliable asynchronous processing, database consistency, retries, concurrency, and idempotency in a backend system.
 
 ## Scope
@@ -113,13 +113,30 @@ violations for the active idempotency index are translated to domain conflicts.
 ### Get Order
 `GET /orders/:id`
 
+Requires `X-User-Id: <UUID>` and returns only an order belonging to that user.
+An absent or inaccessible order returns 404. The response includes `id`,
+`accountId`, `status`, `processingStep`, `amount`, `currency`, and timestamps.
+
 ### List Orders
 `GET /orders`
+
+Requires `X-User-Id: <UUID>`. Optional query parameters: `page` (default 1),
+`limit` (default 20, maximum 100), and uppercase `status`. Returns
+`{ items, page, limit, total }`, ordered by newest creation first.
 
 ### Cancel Order
 `POST /orders/:id/cancel`
 
-Get, list, and cancel endpoints above are planned contracts.
+Requires `X-User-Id: <UUID>`. Returns 200 with
+`{ id, status: "CANCELLED", processingStep: "CANCELLED_BY_USER" }`. Cancellation
+uses one conditional UPDATE restricted to that user's order in `PENDING` and
+`PENDING_CREATED`. An absent or inaccessible order returns 404; an order that
+cannot be cancelled returns 409, including a repeated cancellation.
+
+`X-User-Id` is a temporary caller-supplied identity, not authentication. These
+endpoints scope database operations to that value; an authenticated identity
+must replace the header for production. Missing or invalid UUIDs and invalid
+pagination/status parameters return 400.
 
 ## Running Locally
 

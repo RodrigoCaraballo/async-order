@@ -29,6 +29,19 @@ export enum OrderStatus {
   CANCELED = 'CANCELLED',
 }
 
+export interface ListOrdersQuery {
+  page: number;
+  limit: number;
+  status?: OrderStatus;
+}
+
+export interface OrderPage {
+  items: Order[];
+  page: number;
+  limit: number;
+  total: number;
+}
+
 export enum OrderProcessingSteps {
   PENDING_CREATED = 'PENDING_CREATED',
   PROCESSING_STARTED = 'PROCESSING_STARTED',

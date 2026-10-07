@@ -89,11 +89,28 @@ orden; esa recuperación requiere una estrategia adicional.
 
 ## Decisiones y límites
 
+El recorrido vigente del worker es `PENDING_CREATED` → `PROCESSING_STARTED` →
+`PROCESSING_ACCOUNT_VALIDATED` → `PAID_COMPLETED`, con `CANCELLED_BY_USER` como
+salida terminal. La validación de cuenta indica existencia, actividad y vigencia;
+no significa que se haya debitado saldo. Los campos para actividad/vigencia aún
+no existen en `accounts`, por lo que esa validación sigue pendiente.
+
+Los valores `PROCESSING_ACCOUNT_DEBITED`, `PROCESSING_PAYMENT_REQUESTED` y
+`PROCESSING_PAYMENT_CONFIRMED` siguen permitidos por el enum y los checks del
+esquema, pero no forman parte del switch vigente. Este ajuste documental no
+modifica la base ni requiere ejecutar una migración.
+
+El débito local y `PAID` / `PAID_COMPLETED` deben confirmarse en una misma
+transacción. El UPDATE del saldo debe restar sobre el valor actual de PostgreSQL,
+exigir fondos suficientes y comprobar elegibilidad de la cuenta al debitar.
+La implementación de estas garantías y del pago completo está pendiente.
+
 - Se conserva `VARCHAR` para estados y pasos, como en el SQL del documento;
   los `CHECK` restringen sus valores y exigen que el prefijo del paso coincida
   con el estado.
 - `accounts` no tiene columna `version`. El diseño del débito contempla un
-  UPDATE condicional atómico sobre el saldo; el worker aún no está implementado.
+  UPDATE condicional atómico sobre el saldo; el worker está en desarrollo y
+  esa garantía aún debe completarse en la implementación.
 - Los UUID los suministra la aplicación. `created_at` y `updated_at` tienen
   `DEFAULT now()` en ambas tablas: PostgreSQL proporciona la fecha al insertar
   si se omite la columna. Los valores explícitos de la aplicación prevalecen.

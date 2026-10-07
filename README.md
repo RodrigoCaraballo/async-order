@@ -2,7 +2,7 @@
 
 ## Overview
 Async Order is a backend service for managing orders that are processed asynchronously.
-Order creation, querying, listing, and cancellation are implemented. Worker processing remains part of the planned scope.
+Order creation, querying, listing, and cancellation are implemented. Worker processing is in progress.
 The main goal of this project is to explore reliable asynchronous processing, database consistency, retries, concurrency, and idempotency in a backend system.
 
 ## Scope
@@ -25,6 +25,33 @@ Depending on the execution result, an order may also become:
 - `FAILED`
 - `CANCELLED`
 
+The intended processing path follows the current use-case switch:
+
+```text
+PENDING_CREATED
+  → PROCESSING_STARTED
+  → PROCESSING_ACCOUNT_VALIDATED
+  → PAID_COMPLETED
+```
+
+The worker checks that the order is still eligible, validates that the account
+exists and is active and valid, attempts payment, and records the final result.
+`PROCESSING_ACCOUNT_VALIDATED` records account eligibility, not a balance check
+or a completed debit. Payment must still check sufficient funds and current
+account eligibility when applying the debit. `PAID_COMPLETED` and
+`CANCELLED_BY_USER` end processing without repeating effects.
+
+The payment path does not use separate debit/request/confirmation checkpoints.
+Those older values remain in the enum and database checks; this documentation
+change does not remove them from the schema. Failure values also remain defined,
+but the current switch does not handle them yet.
+
+Account active/valid fields, the complete payment handler, transaction boundaries,
+and consumer acknowledgement/retry handling remain to be implemented. A local
+debit and the final paid state must commit together to prevent duplicate debits
+on redelivery. An external provider would additionally require idempotency using
+the order ID.
+
 ## Tech Stack
 
 - NestJS
@@ -37,8 +64,8 @@ Depending on the execution result, an order may also become:
 
 The API is responsible for accepting and validating requests and persisting the initial order state.
 Order creation persists a `PENDING` order and publishes an `order.created` event
-with `{ orderId }` to RabbitMQ. Worker processing is planned; no worker is
-registered yet.
+with `{ orderId }` to RabbitMQ. The RMQ consumer and processing use case are
+under development; the end-to-end payment flow is not complete.
 
 Basic flow:
 
@@ -113,8 +140,8 @@ violations for the active idempotency index are translated to domain conflicts.
 ### Get Order
 `GET /orders/:id`
 
-Requires `X-User-Id: <UUID>` and returns only an order belonging to that user.
-An absent or inaccessible order returns 404. The response includes `id`,
+Requires `X-User-Id: <UUID>` as fake authorization and looks up the order by ID
+only, independently of its user. An absent order returns 404. The response includes `id`,
 `accountId`, `status`, `processingStep`, `amount`, `currency`, and timestamps.
 
 ### List Orders
@@ -123,19 +150,20 @@ An absent or inaccessible order returns 404. The response includes `id`,
 Requires `X-User-Id: <UUID>`. Optional query parameters: `page` (default 1),
 `limit` (default 20, maximum 100), and uppercase `status`. Returns
 `{ items, page, limit, total }`, ordered by newest creation first.
+The list includes orders from all users; the header does not filter results.
 
 ### Cancel Order
 `POST /orders/:id/cancel`
 
 Requires `X-User-Id: <UUID>`. Returns 200 with
 `{ id, status: "CANCELLED", processingStep: "CANCELLED_BY_USER" }`. Cancellation
-uses one conditional UPDATE restricted to that user's order in `PENDING` and
-`PENDING_CREATED`. An absent or inaccessible order returns 404; an order that
+uses one conditional UPDATE by order ID in `PENDING` and
+`PENDING_CREATED`, independently of its user. An absent order returns 404; an order that
 cannot be cancelled returns 409, including a repeated cancellation.
 
-`X-User-Id` is a temporary caller-supplied identity, not authentication. These
-endpoints scope database operations to that value; an authenticated identity
-must replace the header for production. Missing or invalid UUIDs and invalid
+`FakeAuthorizationGuard` checks that `X-User-Id` is present and is a UUID.
+This simulates authorization; it does not authenticate or check ownership.
+The value is not passed to use cases or repository methods. Missing or invalid UUIDs and invalid
 pagination/status parameters return 400.
 
 ## Running Locally
@@ -188,7 +216,8 @@ column.
 `QueueModule` exports a Nest `ClientProxy` under the `ORDER_QUEUE_CLIENT` token
 for a durable `orders` queue (override with `RABBITMQ_QUEUE`). Import `QueueModule`
 in modules that inject this client. Its connection is lazy: it connects on the
-first operation or an explicit `client.connect()`. No worker is registered yet.
+first operation or an explicit `client.connect()`. The event controller and
+processing use case are in development and are not registered in their modules yet.
 Use Nest RMQ message envelopes when publishing to a Nest RMQ consumer, not raw
 AMQP payloads.
 

@@ -5,6 +5,7 @@ import {
   Post,
   Req,
   UseInterceptors,
+  UseGuards,
   Get,
   Param,
   Query,
@@ -30,7 +31,7 @@ import { IListOrdersUseCase } from '../../domain/interfaces/order/list-orders.us
 import { ICancelOrderUseCase } from '../../domain/interfaces/order/cancel-order.use-case';
 import type { CancelOrderResult } from '../../domain/interfaces/order/cancel-order.use-case';
 import { OrderStatus } from '../../domain/interfaces/order/order.interface';
-import { UserId } from '../decorators/user-id.decorator';
+import { FakeAuthorizationGuard } from '../guards/fake-authorization.guard';
 
 @Controller('orders')
 export class OrderController {
@@ -64,16 +65,16 @@ export class OrderController {
   }
 
   @Get(':id')
+  @UseGuards(FakeAuthorizationGuard)
   async getOrder(
     @Param('id', new ParseUUIDPipe()) id: string,
-    @UserId(new ParseUUIDPipe()) userId: string,
   ): Promise<OrderResponseDto> {
-    return mapToResponse(await this.getOrderUseCase.execute(id, userId));
+    return mapToResponse(await this.getOrderUseCase.execute(id));
   }
 
   @Get()
+  @UseGuards(FakeAuthorizationGuard)
   async listOrders(
-    @UserId(new ParseUUIDPipe()) userId: string,
     @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit: number,
     @Query('status') status?: string,
@@ -96,7 +97,7 @@ export class OrderController {
     ) {
       throw new BadRequestException('Invalid order status');
     }
-    const result = await this.listOrdersUseCase.execute(userId, {
+    const result = await this.listOrdersUseCase.execute({
       page,
       limit,
       status: status as OrderStatus | undefined,
@@ -105,11 +106,11 @@ export class OrderController {
   }
 
   @Post(':id/cancel')
+  @UseGuards(FakeAuthorizationGuard)
   @HttpCode(200)
   cancelOrder(
     @Param('id', new ParseUUIDPipe()) id: string,
-    @UserId(new ParseUUIDPipe()) userId: string,
   ): Promise<CancelOrderResult> {
-    return this.cancelOrderUseCase.execute(id, userId);
+    return this.cancelOrderUseCase.execute(id);
   }
 }

@@ -12,7 +12,7 @@ export class ListOrdersUseCase implements IListOrdersUseCase {
     @Inject(IOrderRepository) private readonly orders: IOrderRepository,
   ) {}
 
-  execute(userId: string, query: ListOrdersQuery): Promise<OrderPage> {
-    return this.orders.findAll(userId, query);
+  execute(query: ListOrdersQuery): Promise<OrderPage> {
+    return this.orders.findAll(query);
   }
 }

@@ -16,15 +16,15 @@ export class CancelOrderUseCase implements ICancelOrderUseCase {
     @Inject(IOrderRepository) private readonly orders: IOrderRepository,
   ) {}
 
-  async execute(id: string, userId: string): Promise<CancelOrderResult> {
-    if (await this.orders.cancelPending(id, userId)) {
+  async execute(id: string): Promise<CancelOrderResult> {
+    if (await this.orders.cancelPending(id)) {
       return {
         id,
         status: OrderStatus.CANCELED,
         processingStep: OrderProcessingSteps.CANCELLED_BY_USER,
       };
     }
-    if (!(await this.orders.findById(id, userId))) {
+    if (!(await this.orders.findById(id))) {
       throw new InternalServiceError('Order not found', ErrorCode.NOT_FOUND);
     }
     throw new InternalServiceError(

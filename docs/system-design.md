@@ -93,9 +93,6 @@ Examples:
 PENDING_CREATED
 PROCESSING_STARTED
 PROCESSING_ACCOUNT_VALIDATED
-PROCESSING_ACCOUNT_DEBITED
-PROCESSING_PAYMENT_REQUESTED
-PROCESSING_PAYMENT_CONFIRMED
 PAID_COMPLETED
 FAILED_INSUFFICIENT_FUNDS
 FAILED_PAYMENT
@@ -110,10 +107,17 @@ Example:
 
 ```text
 status: PROCESSING
-processingStep: PROCESSING_ACCOUNT_DEBITED
+processingStep: PROCESSING_ACCOUNT_VALIDATED
 ```
 
-This means that the order is still processing, but the system knows that the associated account has already been debited.
+This means that the order is still processing and its account eligibility was
+validated. It does not mean that the balance was debited or payment succeeded.
+
+The current processing switch uses `PENDING_CREATED`, `PROCESSING_STARTED`,
+`PROCESSING_ACCOUNT_VALIDATED`, `PAID_COMPLETED`, and `CANCELLED_BY_USER`.
+`FAILED_INSUFFICIENT_FUNDS` and `FAILED_PAYMENT` remain defined, but their switch
+handlers are not implemented. The older debit/request/confirmation steps remain
+in the enum and SQL checks for now; they are not part of the current workflow.
 
 The processing step is persisted in PostgreSQL and is therefore part of the durable order state.
 
@@ -158,35 +162,19 @@ status = PROCESSING
 processingStep = PROCESSING_STARTED
 ```
 
-After validating the account:
+After checking that the account exists and is active and valid:
 
 ```text
 status = PROCESSING
 processingStep = PROCESSING_ACCOUNT_VALIDATED
 ```
 
-After successfully debiting the account:
+From `PROCESSING_ACCOUNT_VALIDATED`, attempt the payment and record its final
+result without separate debit/request/confirmation checkpoints. This checkpoint
+does not validate sufficient balance or reserve funds. Account eligibility can
+change after validation and must still hold when the debit is applied.
 
-```text
-status = PROCESSING
-processingStep = PROCESSING_ACCOUNT_DEBITED
-```
-
-Before calling the payment provider:
-
-```text
-status = PROCESSING
-processingStep = PROCESSING_PAYMENT_REQUESTED
-```
-
-After receiving payment confirmation:
-
-```text
-status = PROCESSING
-processingStep = PROCESSING_PAYMENT_CONFIRMED
-```
-
-When processing is fully completed:
+When the payment is successfully completed:
 
 ```text
 status = PAID
@@ -213,6 +201,13 @@ If a pending order is cancelled:
 status = CANCELLED
 processingStep = CANCELLED_BY_USER
 ```
+
+Implementation status: the processing use case is in progress. The account
+entity has no active/valid fields yet, and the current validation checks only
+existence. The validated-account switch branch does not invoke payment yet.
+Atomic debit/finalization and consumer acknowledgement/retry handling remain
+pending. The transitions above describe the intended behavior, not guarantees
+already implemented by the full payment flow.
 
 A user may create another order only after the previous order reaches a terminal state.
 
@@ -264,7 +259,7 @@ For example:
 
 ```text
 status = PROCESSING
-processingStep = PROCESSING_ACCOUNT_DEBITED
+processingStep = PROCESSING_ACCOUNT_VALIDATED
 ```
 
 is valid.
@@ -335,11 +330,14 @@ Example:
 ```text
 Order received again
 
-status = PROCESSING
-processingStep = PROCESSING_ACCOUNT_DEBITED
+status = PAID
+processingStep = PAID_COMPLETED
 ```
 
-The worker now knows that the account debit step has already been completed and must not blindly execute the same debit again.
+The worker ends processing without attempting payment again. A cancelled order
+also ends without effects. For a local debit, its balance change and the final
+paid state must commit in the same transaction; otherwise a crash between them
+could leave the order eligible for a second debit.
 
 However, `processingStep` alone does not guarantee exactly-once processing for external side effects.
 
@@ -350,7 +348,7 @@ Payment Provider successfully processes payment
         ↓
 Worker crashes
         ↓
-PROCESSING_PAYMENT_CONFIRMED was never persisted
+PAID_COMPLETED was never persisted
 ```
 
 When the message is retried, PostgreSQL cannot determine solely from `processingStep` whether the provider processed the payment.
@@ -466,13 +464,15 @@ The worker will:
 1. Receive an order-processing message.
 2. Retrieve the current durable order state.
 3. Inspect `status` and `processingStep`.
-4. Determine whether the order can still be processed.
-5. Transition the order to the next valid processing step.
-6. Attempt to debit the associated account safely when required.
-7. Detect insufficient funds or concurrent account modifications.
-8. Execute the payment operation when required.
-9. Persist each durable workflow transition.
-10. Retry temporary failures according to the configured retry strategy.
+4. End without effects for completed or cancelled orders.
+5. Claim an eligible pending order with a conditional transition to `PROCESSING_STARTED`.
+6. Validate the account's existence, active status, and validity, recording `PROCESSING_ACCOUNT_VALIDATED`.
+7. Attempt payment with sufficient funds and current account eligibility enforced at debit time.
+8. Persist the final result; a local debit and `PAID_COMPLETED` must commit together.
+9. Reevaluate the current order state on inconsistent-event retries and retry temporary failures according to the consumer policy.
+
+The validation checkpoint alone does not grant exclusive ownership of payment
+processing. Concurrent deliveries must not both apply the same order's debit.
 
 ---
 
@@ -516,12 +516,6 @@ PROCESSING_STARTED
         ↓
 PROCESSING_ACCOUNT_VALIDATED
         ↓
-PROCESSING_ACCOUNT_DEBITED
-        ↓
-PROCESSING_PAYMENT_REQUESTED
-        ↓
-PROCESSING_PAYMENT_CONFIRMED
-        ↓
 PAID_COMPLETED
 ```
 
@@ -544,7 +538,7 @@ FAILED_INSUFFICIENT_FUNDS
 Payment failure flow:
 
 ```text
-PROCESSING_PAYMENT_REQUESTED
+PROCESSING_ACCOUNT_VALIDATED
         ↓
 FAILED_PAYMENT
 ```
@@ -565,15 +559,28 @@ Example:
 processingStep = PROCESSING_ACCOUNT_VALIDATED
 ```
 
-The worker knows that account validation has already completed and may continue with the debit operation.
+The worker knows that account eligibility was checked and may attempt payment.
+This checkpoint does not record a balance reservation or debit. Eligibility
+must still hold when the account is debited.
 
 Another example:
 
 ```text
-processingStep = PROCESSING_ACCOUNT_DEBITED
+processingStep = PAID_COMPLETED
 ```
 
-The worker must not execute the account debit again.
+The worker must end without executing payment again. `CANCELLED_BY_USER` also
+ends without effects. Reaching a processing checkpoint on redelivery does not
+prove that a previous worker has stopped; safe resumption requires preventing
+two workers from performing the same payment concurrently.
+
+If the conditional start transition updates no row, the use case signals
+`RETRY_INCONSISTENT_EVENT`. The intended consumer policy is to redeliver with a
+bounded delay, reread the order by ID, and dispatch according to its new step.
+Paid or cancelled orders then finish without effects. This classification alone
+does not schedule retries; consumer handling remains pending. A processing step
+is not evidence that the previous worker stopped, so retrying must not permit
+concurrent payment effects.
 
 The processing step acts as a durable workflow checkpoint and allows the worker to determine which internal operations have already completed.
 
@@ -670,6 +677,7 @@ The API receives an `accountId` from the client.
 The system must verify that:
 
 - the account exists;
+- the account is active and valid at validation time and remains eligible when debited;
 - the requesting user is authorized to use the account.
 
 Multiple users may reference the same account so concurrent account operations can occur.
@@ -685,15 +693,7 @@ Validate account
         ↓
 PROCESSING_ACCOUNT_VALIDATED
         ↓
-Atomic account debit
-        ↓
-PROCESSING_ACCOUNT_DEBITED
-        ↓
-PROCESSING_PAYMENT_REQUESTED
-        ↓
-Payment Provider
-        ↓
-PROCESSING_PAYMENT_CONFIRMED
+Attempt payment / atomic debit
         ↓
 PAID_COMPLETED
 ```
@@ -712,7 +712,11 @@ Payment-provider failures transition the order to:
 FAILED_PAYMENT
 ```
 
-Retries must never cause the account debit to be executed again after `PROCESSING_ACCOUNT_DEBITED` has been persisted.
+There is no separate durable debit checkpoint in this flow. For a local payment,
+the conditional debit and final paid state must commit together, with protection
+against concurrent processing of the same order. Retrying `PAID_COMPLETED` must
+not repeat the debit. If a provider is involved, external payment idempotency is
+also required; a local database transaction cannot roll back a provider call.
 
 ---
 
@@ -723,7 +727,7 @@ Retries must never cause the account debit to be executed again after `PROCESSIN
 Example:
 
 ```text
-PROCESSING_PAYMENT_REQUESTED persisted
+PROCESSING_ACCOUNT_VALIDATED persisted
         ↓
 Provider successfully processes payment
         ↓
@@ -733,7 +737,7 @@ Worker crashes before persisting confirmation
 PostgreSQL still contains:
 
 ```text
-PROCESSING_PAYMENT_REQUESTED
+PROCESSING_ACCOUNT_VALIDATED
 ```
 
 After retry, the system cannot safely infer from the internal processing step alone whether the provider already processed the payment.
@@ -772,13 +776,13 @@ Example:
 ```text
 Message #1
    ↓
-PROCESSING_ACCOUNT_DEBITED
+PAID_COMPLETED (committed with the local debit)
 
 Worker crashes
 
 Message #1 redelivered
    ↓
-Worker reads PROCESSING_ACCOUNT_DEBITED
+Worker reads PAID_COMPLETED
    ↓
 Account debit is skipped
 ```
@@ -1068,9 +1072,6 @@ PENDING_CREATED
 
 PROCESSING_STARTED
 PROCESSING_ACCOUNT_VALIDATED
-PROCESSING_ACCOUNT_DEBITED
-PROCESSING_PAYMENT_REQUESTED
-PROCESSING_PAYMENT_CONFIRMED
 
 PAID_COMPLETED
 
@@ -1263,9 +1264,10 @@ code returns a generic 500; existing Nest exceptions retain their responses.
 An account that does not exist returns 404 with `Provided account does not exist`.
 
 Create, get, list, and cancel endpoints are implemented. Get, list, and cancel
-require the temporary `X-User-Id: <UUID>` header. This is caller-supplied identity,
-not authentication; production authorization must derive it from authenticated
-context. These operations filter by user ID at the repository boundary.
+require the temporary `X-User-Id: <UUID>` header. `FakeAuthorizationGuard` checks
+its presence and UUID format only. This simulates authorization without
+authentication or ownership checks. The header is not passed to the use cases
+or repository: get and cancel operate by order ID, and list includes all users.
 
 ---
 
@@ -1280,7 +1282,7 @@ Response:
   "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
   "accountId": "a27ac10b-84cc-4372-a567-0e02b2c3d111",
   "status": "PROCESSING",
-  "processingStep": "PROCESSING_ACCOUNT_DEBITED",
+  "processingStep": "PROCESSING_ACCOUNT_VALIDATED",
   "amount": 120.50,
   "currency": "USD",
   "createdAt": "2026-10-06T15:00:00Z",
@@ -1290,8 +1292,8 @@ Response:
 
 `processingStep` is returned by the API in this project so the current durable workflow checkpoint can be inspected.
 
-Returns 200 for an accessible order, 404 for an absent order or one belonging to
-another user, and 400 for missing/invalid user UUID or invalid order UUID.
+Returns 200 for an existing order regardless of its user, 404 for an absent
+order, and 400 for missing/invalid header UUID or invalid order UUID.
 The response omits `idempotencyKey` and converts PostgreSQL's numeric amount to
 a JSON number.
 
@@ -1320,11 +1322,11 @@ Response:
 }
 ```
 
-The result must contain only orders belonging to the requesting user.
-The implementation filters by `X-User-Id` and optional uppercase status, sorts
+The result contains orders from all users.
+The implementation filters only by optional uppercase status, sorts
 by `createdAt DESC, id DESC`, and uses offset pagination. Page must be a positive
 safe integer, and limit must be between 1 and 100; malformed values return 400.
-`total` is the count matching the user and optional status, before pagination.
+`total` is the global count matching the optional status, before pagination.
 
 ---
 
@@ -1358,11 +1360,11 @@ Response:
 
 If the worker has already successfully transitioned the order to `PROCESSING`, cancellation must be rejected.
 
-The current endpoint returns 200 on success, 404 for an absent or inaccessible
+The current endpoint returns 200 on success, 404 for an absent
 order, and 409 when the order no longer meets the pending conditions (including
 repeat cancellation). It performs one conditional UPDATE including order ID,
-user ID, `PENDING`, and `PENDING_CREATED`, changing status and step together.
-If no row changes, a user-scoped lookup distinguishes 404 from 409. No RabbitMQ
+`PENDING`, and `PENDING_CREATED`, changing status and step together.
+If no row changes, a lookup by ID distinguishes 404 from 409. No RabbitMQ
 message is published for cancellation.
 
 The implementation must correctly handle the race condition between:

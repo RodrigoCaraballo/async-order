@@ -8,6 +8,8 @@ import { CancelOrderUseCase } from './application/cancel-order.use-case';
 import { IGetOrderUseCase } from './interfaces/order/get-order.use-case';
 import { IListOrdersUseCase } from './interfaces/order/list-orders.use-case';
 import { ICancelOrderUseCase } from './interfaces/order/cancel-order.use-case';
+import { IProcessOrderUseCase } from './interfaces/order/process-order.use-case';
+import { ProcessOrderUseCase } from './application/process-order.use-case';
 
 @Module({
   imports: [InfrastructureModule],
@@ -16,12 +18,14 @@ import { ICancelOrderUseCase } from './interfaces/order/cancel-order.use-case';
     { useClass: GetOrderUseCase, provide: IGetOrderUseCase },
     { useClass: ListOrdersUseCase, provide: IListOrdersUseCase },
     { useClass: CancelOrderUseCase, provide: ICancelOrderUseCase },
+    { provide: IProcessOrderUseCase, useClass: ProcessOrderUseCase },
   ],
   exports: [
     ICreateOrderUseCase,
     IGetOrderUseCase,
     IListOrdersUseCase,
     ICancelOrderUseCase,
+    IProcessOrderUseCase,
   ],
 })
 export class DomainModule {}

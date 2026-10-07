@@ -1,11 +1,11 @@
 import { IOrderRepository } from '../../domain/interfaces/order/order.repository';
 import {
   CreateOrder,
-  Order,
-  OrderStatus,
-  OrderProcessingSteps,
   ListOrdersQuery,
+  Order,
   OrderPage,
+  OrderProcessingSteps,
+  OrderStatus,
 } from '../../domain/interfaces/order/order.interface';
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -58,13 +58,13 @@ export class OrderTypeOrmRepository implements IOrderRepository {
     });
   }
 
-  findById(id: string, userId: string): Promise<Order | null> {
-    return this.repository.findOneBy({ id, userId });
+  findById(id: string): Promise<Order | null> {
+    return this.repository.findOneBy({ id });
   }
 
-  async findAll(userId: string, query: ListOrdersQuery): Promise<OrderPage> {
+  async findAll(query: ListOrdersQuery): Promise<OrderPage> {
     const [items, total] = await this.repository.findAndCount({
-      where: { userId, ...(query.status ? { status: query.status } : {}) },
+      where: query.status ? { status: query.status } : {},
       order: { createdAt: 'DESC', id: 'DESC' },
       skip: (query.page - 1) * query.limit,
       take: query.limit,
@@ -72,13 +72,68 @@ export class OrderTypeOrmRepository implements IOrderRepository {
     return { items, total, page: query.page, limit: query.limit };
   }
 
-  async cancelPending(id: string, userId: string): Promise<boolean> {
-    // The condition and transition happen in one UPDATE, so a concurrent worker
-    // that already claimed the order prevents cancellation.
+  async updateStartProcessing(id: string): Promise<Order | null> {
+    const order = await this.findById(id);
+    if (!order) {
+      return null;
+    }
+
+    if (order.status !== OrderStatus.PENDING) {
+      return null;
+    }
+
+    order.status = OrderStatus.PROCESSING;
+    order.processingStep = OrderProcessingSteps.PROCESSING_STARTED;
     const result = await this.repository.update(
       {
         id,
-        userId,
+        status: OrderStatus.PENDING,
+        processingStep: OrderProcessingSteps.PENDING_CREATED,
+      },
+      {
+        status: OrderStatus.PROCESSING,
+        processingStep: OrderProcessingSteps.PROCESSING_STARTED,
+      },
+    );
+
+    if (result.affected !== 1) {
+      return null;
+    }
+
+    return order;
+  }
+
+  async updateOrderStatus(
+    order: Order,
+    update: Pick<Order, 'status' | 'processingStep'>,
+  ): Promise<Order | null> {
+    const { id, status, processingStep } = order;
+    order.status = update.status;
+    order.processingStep = update.processingStep;
+
+    const result = await this.repository.update(
+      {
+        id,
+        status,
+        processingStep,
+      },
+      {
+        status: update.status,
+        processingStep: update.processingStep,
+      },
+    );
+
+    if (result.affected !== 1) {
+      return null;
+    }
+
+    return order;
+  }
+
+  async cancelPending(id: string): Promise<boolean> {
+    const result = await this.repository.update(
+      {
+        id,
         status: OrderStatus.PENDING,
         processingStep: OrderProcessingSteps.PENDING_CREATED,
       },

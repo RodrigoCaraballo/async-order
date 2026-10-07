@@ -10,8 +10,8 @@ export class GetOrderUseCase implements IGetOrderUseCase {
     @Inject(IOrderRepository) private readonly orders: IOrderRepository,
   ) {}
 
-  async execute(id: string, userId: string): Promise<Order> {
-    const order = await this.orders.findById(id, userId);
+  async execute(id: string): Promise<Order> {
+    const order = await this.orders.findById(id);
     if (!order) {
       throw new InternalServiceError('Order not found', ErrorCode.NOT_FOUND);
     }

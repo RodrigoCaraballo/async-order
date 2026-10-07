@@ -1,4 +1,5 @@
-import { UUID } from 'node:crypto';
+import type { UUID } from 'node:crypto';
+import { IsUUID, IsNumber, IsPositive, Max, Matches } from 'class-validator';
 import {
   CreateOrder,
   Order,
@@ -7,9 +8,17 @@ import {
 } from '../../domain/interfaces/order/order.interface';
 
 export class CreateOrderDto {
+  @IsUUID()
   userId: UUID;
+  @IsUUID()
   accountId: UUID;
+  @IsNumber({ maxDecimalPlaces: 2, allowNaN: false, allowInfinity: false })
+  @IsPositive()
+  @Max(9_999_999_999.99)
   amount: number;
+  @Matches(/^[A-Z]{3}$/, {
+    message: 'currency must be three uppercase letters',
+  })
   currency: string;
 }
 

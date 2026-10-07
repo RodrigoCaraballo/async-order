@@ -115,8 +115,8 @@ validated. It does not mean that the balance was debited or payment succeeded.
 
 The current processing switch uses `PENDING_CREATED`, `PROCESSING_STARTED`,
 `PROCESSING_ACCOUNT_VALIDATED`, `PAID_COMPLETED`, and `CANCELLED_BY_USER`.
-`FAILED_INSUFFICIENT_FUNDS` and `FAILED_PAYMENT` remain defined, but their switch
-handlers are not implemented. The older debit/request/confirmation steps remain
+`FAILED_INSUFFICIENT_FUNDS` and `FAILED_PAYMENT` are handled as terminal steps.
+The older debit/request/confirmation steps remain
 in the enum and SQL checks for now; they are not part of the current workflow.
 
 The processing step is persisted in PostgreSQL and is therefore part of the durable order state.
@@ -204,9 +204,11 @@ processingStep = CANCELLED_BY_USER
 
 Implementation status: the processing use case is in progress. The account
 entity has no active/valid fields yet, and the current validation checks only
-existence. The validated-account switch branch does not invoke payment yet.
+existence. The validated-account switch branch now invokes the account debit.
 Atomic debit/finalization and consumer acknowledgement/retry handling remain
-pending. The transitions above describe the intended behavior, not guarantees
+partially implemented: atomic debit/finalization remains pending, while the
+consumer now acknowledges and uses a bounded fixed-delay retry queue. The
+transitions above describe the intended behavior, not guarantees
 already implemented by the full payment flow.
 
 A user may create another order only after the previous order reaches a terminal state.
@@ -578,7 +580,8 @@ If the conditional start transition updates no row, the use case signals
 `RETRY_INCONSISTENT_EVENT`. The intended consumer policy is to redeliver with a
 bounded delay, reread the order by ID, and dispatch according to its new step.
 Paid or cancelled orders then finish without effects. This classification alone
-does not schedule retries; consumer handling remains pending. A processing step
+does not schedule retries by itself; the consumer publishes to the retry queue
+and acknowledges the original after publisher confirmation. A processing step
 is not evidence that the previous worker stopped, so retrying must not permit
 concurrent payment effects.
 
@@ -796,6 +799,31 @@ Critical side effects must additionally have their own consistency guarantees.
 ## Retry Strategy
 
 Temporary processing failures may be retried.
+
+The consumer uses one additional durable queue, `orders.retry`, with
+`x-message-ttl = 5000`, `x-dead-letter-exchange = ''`, and
+`x-dead-letter-routing-key = orders` (names follow configuration). RabbitMQ
+returns expired messages to the main queue; no retry consumer or timer is used.
+This is a fixed delay, not exponential backoff. The main consumer can receive
+other messages while a retry waits in the broker.
+
+The payload contains `{ orderId, retryCount }`, starting at zero. A failed
+attempt with count below three publishes a persistent Nest pattern/data envelope
+with count incremented, waits for broker confirmation, and then acknowledges the
+original. Count three is the final retry. On exhaustion, log and acknowledge,
+preserving the order's current state; there is no final failure DLQ.
+
+NOT_FOUND and BAD_REQUEST are discarded with a log and acknowledgement. Payment
+failure and insufficient-funds errors already persisted as terminal states are
+also acknowledged. Other errors, including `RETRY_INCONSISTENT_EVENT`, follow
+the bounded retry policy. Legacy messages without a count start at zero.
+
+If retry publication fails, negatively acknowledge the original with requeue
+enabled. This exceptional path bypasses the TTL delay and may redeliver quickly.
+A lost acknowledgement after successful retry publication may create duplicates.
+Classic-queue dead-letter transfer is not confirmed internally, so successful
+publication to the retry queue does not guarantee loss-free return routing during
+broker failures. Both queues must exist when TTL expiration routes the message.
 
 Retries must never cause:
 

@@ -1,0 +1,5 @@
+export const ORDER_QUEUE_CLIENT = Symbol('ORDER_QUEUE_CLIENT');
+export const ORDER_RETRY_QUEUE_CLIENT = Symbol('ORDER_RETRY_QUEUE_CLIENT');
+
+export const ORDER_RETRY_DELAY_MS = 5_000;
+export const ORDER_MAX_RETRIES = 3;

@@ -14,6 +14,7 @@ import {
   DefaultValuePipe,
   BadRequestException,
   HttpCode,
+  ValidationPipe,
 } from '@nestjs/common';
 import { CreateOrderInterceptor } from '../interceptors/create-order.interceptor';
 import type { OrderRequest } from '../interceptors/create-order.interceptor';
@@ -49,7 +50,8 @@ export class OrderController {
   @Post()
   @UseInterceptors(CreateOrderInterceptor)
   public async createOrder(
-    @Body() createOrderDTO: CreateOrderDto,
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+    createOrderDTO: CreateOrderDto,
     @Req() request: OrderRequest,
   ): Promise<CreateOrderResponseDto> {
     const orderId = await this.createOrderUseCase.execute(

@@ -43,11 +43,11 @@ account eligibility when applying the debit. `PAID_COMPLETED` and
 
 The payment path does not use separate debit/request/confirmation checkpoints.
 Those older values remain in the enum and database checks; this documentation
-change does not remove them from the schema. Failure values also remain defined,
-but the current switch does not handle them yet.
+change does not remove them from the schema. Failed, paid, and cancelled terminal
+steps end processing without attempting another debit.
 
 Account active/valid fields, the complete payment handler, transaction boundaries,
-and consumer acknowledgement/retry handling remain to be implemented. A local
+remain to be completed. Consumer acknowledgement and bounded retries are implemented. A local
 debit and the final paid state must commit together to prevent duplicate debits
 on redelivery. An external provider would additionally require idempotency using
 the order ID.
@@ -64,7 +64,7 @@ the order ID.
 
 The API is responsible for accepting and validating requests and persisting the initial order state.
 Order creation persists a `PENDING` order and publishes an `order.created` event
-with `{ orderId }` to RabbitMQ. The RMQ consumer and processing use case are
+with `{ orderId, retryCount: 0 }` to RabbitMQ. The RMQ consumer and processing use case are
 under development; the end-to-end payment flow is not complete.
 
 Basic flow:
@@ -136,6 +136,11 @@ The global `InternalServiceErrorFilter` maps `CONFLICT` to 409 and `NOT_FOUND`
 to 404, preserving domain messages. Unknown internal codes return a generic
 500. Existing Nest exceptions retain their behavior. PostgreSQL uniqueness
 violations for the active idempotency index are translated to domain conflicts.
+
+Creation uses `class-validator` and a request-body `ValidationPipe`: both IDs
+must be UUIDs, amount must be a positive JSON number with at most two decimal
+places and no greater than `9999999999.99`, and currency must be three uppercase
+letters. Missing/invalid values and additional fields return 400.
 
 ### Get Order
 `GET /orders/:id`
@@ -217,7 +222,28 @@ column.
 for a durable `orders` queue (override with `RABBITMQ_QUEUE`). Import `QueueModule`
 in modules that inject this client. Its connection is lazy: it connects on the
 first operation or an explicit `client.connect()`. The event controller and
-processing use case are in development and are not registered in their modules yet.
+processing use case are registered; the payment consistency guarantees above
+remain to be completed.
+
+### RabbitMQ retries
+
+`orders.retry` (override with `RABBITMQ_RETRY_QUEUE`) is a durable queue with a
+fixed 5-second message TTL and dead-letter routing back to the main queue. It
+has no consumer or application timer. Retry publication uses Nest's confirmed
+RMQ publisher; the original is acknowledged only after publication completes.
+The broker's dead-letter mechanism provides the return route; there is no final
+failure DLQ. Classic-queue dead-letter transfer is not itself publisher-confirmed,
+so this setup does not guarantee loss-free transfer during broker failures.
+
+Messages start with `retryCount: 0`; legacy messages without the field also
+start at zero. Retryable and unexpected errors schedule up to three retries
+(four executions total). NOT_FOUND, BAD_REQUEST, persisted payment failure and
+insufficient funds are logged and acknowledged without retry. On exhaustion,
+the event is logged and discarded, preserving the order's current state.
+If retry publication fails, the original is negatively acknowledged with
+requeue enabled; this exceptional recovery path has no TTL delay.
+Queue declaration is lazy on the first retry. Keep the retry queue name distinct
+from the main queue. Existing queues must have matching arguments.
 Use Nest RMQ message envelopes when publishing to a Nest RMQ consumer, not raw
 AMQP payloads.
 

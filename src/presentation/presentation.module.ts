@@ -6,9 +6,10 @@ import { InternalServiceErrorFilter } from './filters/internal-service-error.fil
 import { CreateOrderInterceptor } from './interceptors/create-order.interceptor';
 import { FakeAuthorizationGuard } from './guards/fake-authorization.guard';
 import { OrderEventsController } from './controllers/order-events.controller';
+import { QueueModule } from '../infrastructure/queue.module';
 
 @Module({
-  imports: [DomainModule],
+  imports: [DomainModule, QueueModule],
   controllers: [OrderController, OrderEventsController],
   providers: [
     FakeAuthorizationGuard,

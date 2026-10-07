@@ -2,7 +2,9 @@
 
 ## Overview
 Async Order is a backend service for managing orders that are processed asynchronously.
-Order creation, querying, listing, and cancellation are implemented. Worker processing is in progress.
+Order creation, querying, listing, cancellation, and a local-debit worker are implemented.
+The consumer uses manual acknowledgements and bounded fixed-delay retries; payment
+consistency and concurrency guarantees remain incomplete.
 The main goal of this project is to explore reliable asynchronous processing, database consistency, retries, concurrency, and idempotency in a backend system.
 
 ## Scope
@@ -25,7 +27,7 @@ Depending on the execution result, an order may also become:
 - `FAILED`
 - `CANCELLED`
 
-The intended processing path follows the current use-case switch:
+The processing path follows the current use-case switch:
 
 ```text
 PENDING_CREATED
@@ -46,9 +48,13 @@ Those older values remain in the enum and database checks; this documentation
 change does not remove them from the schema. Failed, paid, and cancelled terminal
 steps end processing without attempting another debit.
 
-Account active/valid fields, the complete payment handler, transaction boundaries,
-remain to be completed. Consumer acknowledgement and bounded retries are implemented. A local
-debit and the final paid state must commit together to prevent duplicate debits
+Account active/valid fields and payment transaction boundaries remain to be
+completed. The current worker checks account existence, attempts a local debit,
+and updates the final order state separately. The balance update uses a previously
+read balance and a strict `balance > amount` condition: it is not the intended
+atomic subtraction and incorrectly rejects an exact-balance payment. Consumer
+acknowledgement and bounded retries are implemented. A local debit and the final
+paid state must commit together to prevent duplicate debits
 on redelivery. An external provider would additionally require idempotency using
 the order ID.
 
@@ -64,12 +70,12 @@ the order ID.
 
 The API is responsible for accepting and validating requests and persisting the initial order state.
 Order creation persists a `PENDING` order and publishes an `order.created` event
-with `{ orderId, retryCount: 0 }` to RabbitMQ. The RMQ consumer and processing use case are
-under development; the end-to-end payment flow is not complete.
+with `{ orderId, retryCount: 0 }` to RabbitMQ. The RMQ consumer invokes the processing
+use case in the same NestJS application. No external payment provider is integrated.
 
 Basic flow:
 
-`Client -> API -> PostgreSQL -> RabbitMQ -> Worker -> Payment Provider`
+`Client -> API -> PostgreSQL -> RabbitMQ -> Worker -> PostgreSQL (local debit/order state)`
 
 More detailed architecture decisions are documented in [`docs/system-design.md`](./docs/system-design.md).
 
@@ -218,26 +224,40 @@ for `created_at` and `updated_at` on insert; direct SQL updates must set
 `updated_at` explicitly (there is no update trigger). Accounts have no `version`
 column.
 
-`QueueModule` exports a Nest `ClientProxy` under the `ORDER_QUEUE_CLIENT` token
-for a durable `orders` queue (override with `RABBITMQ_QUEUE`). Import `QueueModule`
-in modules that inject this client. Its connection is lazy: it connects on the
-first operation or an explicit `client.connect()`. The event controller and
-processing use case are registered; the payment consistency guarantees above
-remain to be completed.
+`QueueModule` registers and exports two Nest `ClientProxy` instances through
+`ClientsModule.registerAsync`: `ORDER_QUEUE_CLIENT` for the main queue and
+`ORDER_RETRY_QUEUE_CLIENT` for the retry queue. Both publishers use
+`await lastValueFrom(client.emit(...))`, leaving serialization, connections, and
+shutdown to Nest. Tokens and retry limits live in `src/infrastructure/queue.constants.ts`.
+Import `QueueModule` in modules that inject these clients. Connections are lazy:
+they connect on the first operation or an explicit `client.connect()`.
+The main queue defaults to `orders` (override with `RABBITMQ_QUEUE`).
+
+`src/main.ts` starts the main RMQ consumer with `noAck: false` and
+`prefetchCount: 1` alongside the HTTP API. `OrderEventsController` handles
+`order.created`; the retry queue has no consumer.
 
 ### RabbitMQ retries
 
-`orders.retry` (override with `RABBITMQ_RETRY_QUEUE`) is a durable queue with a
+The retry queue defaults to `<main queue>.retry` (`orders.retry` with the default
+main queue; override with `RABBITMQ_RETRY_QUEUE`). It is a durable queue with a
 fixed 5-second message TTL and dead-letter routing back to the main queue. It
-has no consumer or application timer. Retry publication uses Nest's confirmed
+has no consumer or application timer. The delay is fixed, with no incremental
+or exponential backoff and no jitter. Retry publication uses Nest's confirmed
 RMQ publisher; the original is acknowledged only after publication completes.
 The broker's dead-letter mechanism provides the return route; there is no final
 failure DLQ. Classic-queue dead-letter transfer is not itself publisher-confirmed,
 so this setup does not guarantee loss-free transfer during broker failures.
 
+```text
+orders -> process() -> failure -> orders.retry -> TTL expires after 5s -> orders
+```
+
 Messages start with `retryCount: 0`; legacy messages without the field also
 start at zero. Retryable and unexpected errors schedule up to three retries
-(four executions total). NOT_FOUND, BAD_REQUEST, persisted payment failure and
+(four executions along a normal retry chain, not a global execution cap:
+redeliveries and duplicates can cause additional executions). NOT_FOUND,
+BAD_REQUEST, persisted payment failure and
 insufficient funds are logged and acknowledged without retry. On exhaustion,
 the event is logged and discarded, preserving the order's current state.
 If retry publication fails, the original is negatively acknowledged with
@@ -247,6 +267,12 @@ from the main queue. Existing queues must have matching arguments.
 Use Nest RMQ message envelopes when publishing to a Nest RMQ consumer, not raw
 AMQP payloads.
 
+The event controller trusts internal producers and does not manually validate
+the UUID or retry-count type/range. TypeScript types do not validate runtime
+messages; untrusted producers would require validation at the messaging boundary.
+The retry delay and limit are intentionally sufficient for this learning stage;
+backoff, jitter, and a final failure DLQ are possible future improvements.
+
 Use `docker compose ps` to check services and `docker compose logs -f` to inspect
 logs. `docker compose down` stops services while preserving data in named volumes.
 `docker compose down -v` also **deletes all local database and broker data**.
@@ -255,14 +281,15 @@ changing them in Compose does not update an existing database.
 
 ## Documentation
 
-Additional technical documentation can be found under `/docs`:
+Available documentation:
 
-- `system-design.md`
-- `concurrency.md`
-- `failure-scenarios.md`
-- `ai-usage.md`
-- `adr/`
+- [System design, implemented behavior, and pending guarantees](./docs/system-design.md).
+- [PostgreSQL schema and manual upgrades](./scripts/sql/README.md).
+- [Project mentoring and collaboration guidelines](./AGENTS.md).
 
 ## Project Status
 
-Currently under development.
+The messaging/retry design is settled for the current learning stage, not
+production-ready. Pending correctness work includes concurrency-safe balance
+subtraction, atomic debit/order finalization, same-order payment idempotency, and
+recovery of messages whose initial publication fails after order persistence.

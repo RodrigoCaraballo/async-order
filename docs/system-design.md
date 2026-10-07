@@ -1,5 +1,18 @@
 # Async Order - System Design
 
+## Reading This Document
+
+This document combines design requirements with implementation notes. Requirements
+and intended guarantees are not all implemented. The current application runs
+the HTTP API and the main RMQ consumer in one NestJS process, uses a local account
+debit, and has no external payment-provider integration.
+
+Implemented messaging: two clients registered in `QueueModule`, manual consumer
+acknowledgements, and up to three retries with a fixed 5-second delay. Backoff,
+jitter, and a final failure DLQ are deliberately outside the current scope.
+Debit concurrency, atomic debit/finalization, and initial-publication recovery
+remain correctness work, not optional retry enhancements.
+
 ## Functional Requirements
 
 The system must allow a user to:
@@ -205,13 +218,15 @@ processingStep = CANCELLED_BY_USER
 Implementation status: the processing use case is in progress. The account
 entity has no active/valid fields yet, and the current validation checks only
 existence. The validated-account switch branch now invokes the account debit.
-Atomic debit/finalization and consumer acknowledgement/retry handling remain
-partially implemented: atomic debit/finalization remains pending, while the
-consumer now acknowledges and uses a bounded fixed-delay retry queue. The
+The worker attempts a local debit and then records the final order state in a
+separate operation. Atomic debit/finalization remains pending, while the
+consumer acknowledges and uses a bounded fixed-delay retry queue. The
 transitions above describe the intended behavior, not guarantees
 already implemented by the full payment flow.
 
-A user may create another order only after the previous order reaches a terminal state.
+An identical request may create another order only after its matching order is
+terminal and the local request TTL expires. Different keys allow multiple active
+orders for the same user.
 
 ---
 
@@ -593,7 +608,7 @@ For external side effects, such as calls to the payment provider, the processing
 
 ## Account Debit Strategy
 
-Account debits are executed using an atomic conditional update.
+The intended account debit uses an atomic conditional update:
 
 ```sql
 UPDATE accounts
@@ -628,6 +643,13 @@ The application must then determine the corresponding failure reason, such as:
 - insufficient funds.
 
 This strategy avoids a read-before-write race condition.
+
+Implementation gap: `AccountTypeOrmRepository.updateBalance` currently accepts a
+previously read balance, sets `balance = previousBalance - amount`, and uses
+`MoreThan(amount)` (strict `>`). It does not implement the SQL above: concurrent
+updates can overwrite one another, and an exact-balance payment is rejected.
+The debit and final order update also do not share a transaction. These issues
+must be resolved before claiming concurrency-safe or idempotent local payments.
 
 Example:
 
@@ -807,16 +829,37 @@ returns expired messages to the main queue; no retry consumer or timer is used.
 This is a fixed delay, not exponential backoff. The main consumer can receive
 other messages while a retry waits in the broker.
 
+Both clients are registered with `ClientsModule.registerAsync` in `QueueModule`:
+`ORDER_QUEUE_CLIENT` targets the main queue, and `ORDER_RETRY_QUEUE_CLIENT` targets
+the retry queue. `OrderRabbitMqPublisher` and `OrderRetryPublisher` use
+`lastValueFrom(client.emit(ORDER_CREATED_EVENT, payload))`; Nest manages the AMQP
+connections, event envelope, publication confirmation, and client shutdown.
+The retry client connects and declares its queue lazily on the first publication.
+The retry queue defaults to `<main queue>.retry`, can be overridden through
+`RABBITMQ_RETRY_QUEUE`, and must differ from the main queue. Existing declarations
+must have matching arguments. Constants live in `src/infrastructure/queue.constants.ts`.
+
+The consumer is started in `src/main.ts` with manual acknowledgements
+(`noAck: false`) and `prefetchCount: 1`. The HTTP API and consumer currently run
+in the same application; they are logical roles, not separate deployed services.
+
 The payload contains `{ orderId, retryCount }`, starting at zero. A failed
 attempt with count below three publishes a persistent Nest pattern/data envelope
 with count incremented, waits for broker confirmation, and then acknowledges the
 original. Count three is the final retry. On exhaustion, log and acknowledge,
 preserving the order's current state; there is no final failure DLQ.
+This is four attempts along a normal retry chain, not an overall execution cap:
+broker redelivery, failed publications, and duplicate deliveries may add executions.
 
 NOT_FOUND and BAD_REQUEST are discarded with a log and acknowledgement. Payment
 failure and insufficient-funds errors already persisted as terminal states are
 also acknowledged. Other errors, including `RETRY_INCONSISTENT_EVENT`, follow
 the bounded retry policy. Legacy messages without a count start at zero.
+
+The consumer assumes trusted internal producers. It does not manually validate
+the order UUID or retry-count type/range. `OrderCreatedEvent` is a compile-time
+contract, not runtime validation. If external or untrusted producers are added,
+validate at the messaging boundary before relying on that contract.
 
 If retry publication fails, negatively acknowledge the original with requeue
 enabled. This exceptional path bypasses the TTL delay and may redeliver quickly.
@@ -831,7 +874,12 @@ Retries must never cause:
 - duplicated external payments;
 - invalid processing-step transitions.
 
-Retries always resume from the last durable `processingStep`.
+Retries reread the durable `processingStep`; this alone does not make side
+effects safe to repeat. The transaction/idempotency gaps described above remain.
+
+For this learning stage, fixed delay is the settled retry policy. Exponential
+backoff (for example, separate TTL queues for 5s, 10s, and 20s), jitter, and a final
+DLQ can be considered later if operational needs justify the complexity.
 
 ---
 
@@ -1027,6 +1075,10 @@ RabbitMQ will be used as the message broker.
 ---
 
 # System Diagram
+
+The diagram below shows the intended logical architecture. In the current
+implementation API and worker share one process, and the external payment
+provider is not integrated; payment is a local PostgreSQL account debit.
 
 ```text
                     ┌─────────────────┐
@@ -1408,6 +1460,6 @@ PENDING_CREATED -> PROCESSING_STARTED
 ```
 
 Only one transition may succeed.
-The future worker must also claim an order through a conditional transition
-from `PENDING` and `PENDING_CREATED`; cancellation cannot protect against a
-worker that overwrites status without checking its previous value.
+The worker claims an order through a conditional transition from `PENDING` and
+`PENDING_CREATED`. This protects the initial claim/cancellation race, not the
+later debit against concurrent deliveries of the same order.

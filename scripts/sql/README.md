@@ -91,9 +91,10 @@ orden; esa recuperación requiere una estrategia adicional.
 
 El recorrido vigente del worker es `PENDING_CREATED` → `PROCESSING_STARTED` →
 `PROCESSING_ACCOUNT_VALIDATED` → `PAID_COMPLETED`, con `CANCELLED_BY_USER` como
-salida terminal. La validación de cuenta indica existencia, actividad y vigencia;
-no significa que se haya debitado saldo. Los campos para actividad/vigencia aún
-no existen en `accounts`, por lo que esa validación sigue pendiente.
+salida terminal, junto con `FAILED_INSUFFICIENT_FUNDS` y `FAILED_PAYMENT`.
+La validación implementada comprueba solamente existencia; actividad y vigencia
+son requisitos pendientes porque esos campos aún no existen en `accounts`.
+Ese checkpoint no significa que se haya debitado saldo.
 
 Los valores `PROCESSING_ACCOUNT_DEBITED`, `PROCESSING_PAYMENT_REQUESTED` y
 `PROCESSING_PAYMENT_CONFIRMED` siguen permitidos por el enum y los checks del
@@ -103,7 +104,17 @@ modifica la base ni requiere ejecutar una migración.
 El débito local y `PAID` / `PAID_COMPLETED` deben confirmarse en una misma
 transacción. El UPDATE del saldo debe restar sobre el valor actual de PostgreSQL,
 exigir fondos suficientes y comprobar elegibilidad de la cuenta al debitar.
-La implementación de estas garantías y del pago completo está pendiente.
+El worker ya intenta el débito y actualiza el estado final, pero en operaciones
+separadas. El repositorio usa un saldo leído previamente y una condición estricta
+`balance > amount`: puede perder actualizaciones concurrentes y rechaza pagos
+con saldo exacto. La resta atómica, la transacción conjunta y la protección contra
+débitos repetidos de una misma orden siguen pendientes.
+
+Los retries ya están implementados en RabbitMQ: cola durable de espera con TTL
+fijo de 5 segundos y dead-letter hacia la cola principal, sin consumer adicional.
+Hay hasta tres retries por cadena normal; no hay backoff ni DLQ final. Esto no
+resuelve las garantías de consistencia del débito ni requiere cambios al esquema
+SQL. La configuración y sus límites están en `README.md` y `docs/system-design.md`.
 
 - Se conserva `VARCHAR` para estados y pasos, como en el SQL del documento;
   los `CHECK` restringen sus valores y exigen que el prefijo del paso coincida

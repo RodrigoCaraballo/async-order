@@ -6,7 +6,6 @@ import {
   OrderProcessingSteps,
 } from '../interfaces/order/order.interface';
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
 import { IOrderRepository } from '../interfaces/order/order.repository';
 import { IAccountRepository } from '../interfaces/account/account.repository';
 import { ErrorCode, InternalServiceError } from '../interfaces/errors';
@@ -21,8 +20,11 @@ export class CreateOrderUseCase implements ICreateOrderUseCase {
     @Inject(IAccountRepository) private accountRepository: IAccountRepository,
     @Inject(IOrderPublisher) private publisher: IOrderPublisher,
   ) {}
-  async execute(order: CreateOrder, idempotencyKey: string): Promise<string> {
-    const traceId = randomUUID();
+  async execute(
+    order: CreateOrder,
+    idempotencyKey: string,
+    traceId: string,
+  ): Promise<string> {
     const startedAt = Date.now();
     let stage = 'validation';
     let persistedOrderId: string | undefined;
@@ -32,24 +34,16 @@ export class CreateOrderUseCase implements ICreateOrderUseCase {
     try {
       const [lookUpIdempotency] = await Promise.all([
         this.orderRepository.lookUpIdempotence(idempotencyKey),
-        this.validateActiveOrder(order.userId),
         this.validateAccount(order.accountId),
       ]);
 
       this.logger.log({ event: 'order.creation.validated', traceId });
 
-      if (
-        lookUpIdempotency &&
-        (lookUpIdempotency.status === OrderStatus.PENDING ||
-          lookUpIdempotency.status === OrderStatus.PROCESSING)
-      ) {
-        this.logger.log({
-          event: 'order.creation.reused',
-          traceId,
-          orderId: lookUpIdempotency.id,
-          durationMs: Date.now() - startedAt,
-        });
-        return lookUpIdempotency.id;
+      if (lookUpIdempotency) {
+        throw new InternalServiceError(
+          'An identical order is still being processed',
+          ErrorCode.CONFLICT,
+        );
       }
 
       const newOrder: Omit<Order, 'id' | 'createdAt' | 'updatedAt'> = {
@@ -98,25 +92,12 @@ export class CreateOrderUseCase implements ICreateOrderUseCase {
         errorType: error instanceof Error ? error.name : 'UnknownError',
       };
 
-      // Do not log raw errors: driver/broker messages can contain credentials.
       if (error instanceof InternalServiceError) {
         this.logger.warn(context);
       } else {
         this.logger.error(context);
       }
       throw error;
-    }
-  }
-
-  private async validateActiveOrder(userId: string): Promise<void> {
-    const lookUpActiveOrder =
-      await this.orderRepository.lookUpActiveOrder(userId);
-
-    if (lookUpActiveOrder) {
-      throw new InternalServiceError(
-        'An order is currently active',
-        ErrorCode.CONFLICT,
-      );
     }
   }
 

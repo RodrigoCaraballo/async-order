@@ -14,14 +14,15 @@ Once an order is created, the payment process must be executed asynchronously.
 
 ### Active Order Constraint
 
-A user can have only one active order at a time.
+A user can have multiple active orders with different body-derived idempotency keys.
 
 An order is considered active when its status is:
 
 - `PENDING`
 - `PROCESSING`
 
-A user cannot create another order until the current active order reaches a terminal state:
+An identical request cannot create another order until the matching active order
+reaches a terminal state and the interceptor's 10-second TTL expires:
 
 - `PAID`
 - `FAILED`
@@ -136,7 +137,7 @@ The processing step must not be treated as a replacement for idempotency guarant
 1. The client sends a request to create an order.
 2. The request contains the `accountId` that should be debited.
 3. The API validates the request.
-4. The system verifies that the user does not already have an active order.
+4. The system verifies that no order with the same idempotency key is active.
 5. The system verifies that the referenced account exists and can be used by the user.
 6. The order is persisted with:
 
@@ -247,7 +248,7 @@ must not be possible.
 
 The system must guarantee the following business invariants:
 
-> A user can have at most one active order at a time.
+> An idempotency key can belong to at most one active order at a time.
 
 > An account balance must never become negative.
 
@@ -287,18 +288,39 @@ The system must handle idempotency at two different levels.
 
 ### Order Creation Idempotency
 
-Repeated client requests representing the same logical order creation must not create duplicated orders.
+Identical requests must not create simultaneous active orders. A new identical
+payment is allowed after the previous order is terminal and the local TTL expires.
 
-The client should provide an idempotency key.
+The create-order interceptor generates a SHA-256 key from the canonical JSON
+request body and a UUID trace ID, returned through `X-Trace-Id`. Identical bodies
+are rejected with HTTP 409 for 10 seconds using an instance-local Map, including
+when the first request fails. Object property order does not affect the hash.
 
-Example:
+The key is persisted and protected by a partial unique index for `PENDING` and
+`PROCESSING` orders. An identical active order returns HTTP 409 even after the
+local TTL. Once an order is terminal, an identical payment can create a new order.
+This is duplicate suppression while active, not permanent replay of a logical
+request. PostgreSQL constraints provide protection across application instances.
 
-```http
-POST /orders
-Idempotency-Key: order-create-abc123
-```
+The TTL is `10_000` milliseconds, measured from reservation before controller
+execution. Duplicate requests do not renew it. The Map is cleared on shutdown
+and lost on restart; it is not a distributed lock and may expire while a request
+is still executing. Database constraints remain the final concurrency guard.
 
-The idempotency key must be persisted and protected by a unique database constraint.
+The hash covers the entire parsed body, with recursively sorted object keys.
+Array order and JSON values remain significant. It does not include the trace ID
+or a client header. Each request reaching the interceptor receives a fresh trace,
+including rejected duplicates. The controller passes both generated values to
+the use case, whose logs use that trace. The trace is not currently persisted or
+propagated to the RabbitMQ event.
+
+The repository searches the hash only among active orders. An active hash match
+causes a domain conflict; other active orders for the same user are allowed.
+The repository also maps PostgreSQL `23505` violations of the active idempotency
+index to domain conflicts, covering races between validation and insertion.
+
+This allows a retry after a completed payment to create another payment once
+the TTL expires. Clients must not assume such retries replay the previous result.
 
 ### Order Processing Idempotency
 
@@ -343,7 +365,7 @@ Multiple HTTP requests and multiple workers may operate concurrently.
 
 The system must prevent:
 
-- multiple active orders for the same user;
+- multiple active orders sharing the same idempotency key;
 - invalid order state transitions;
 - duplicated payment processing;
 - duplicated account debits;
@@ -398,7 +420,8 @@ A NestJS HTTP API responsible for:
 - order cancellation;
 - validating referenced accounts;
 - enforcing business rules at the application layer;
-- validating idempotency keys;
+- generating request traces and body-derived duplicate keys;
+- rejecting duplicate requests within the local TTL;
 - publishing payment jobs.
 
 ---
@@ -455,9 +478,9 @@ The worker will:
 
 # Database Consistency and Processing Decisions
 
-## One Active Order per User
+## One Active Order per Idempotency Key
 
-A user must never have more than one order whose status is:
+An idempotency key must never belong to more than one order whose status is:
 
 - `PENDING`
 - `PROCESSING`
@@ -465,16 +488,18 @@ A user must never have more than one order whose status is:
 This invariant is enforced directly by PostgreSQL using a partial unique index:
 
 ```sql
-CREATE UNIQUE INDEX unique_active_order_per_user
-ON orders (user_id)
+CREATE UNIQUE INDEX unique_active_order_idempotency_key
+ON orders (idempotency_key)
 WHERE status IN ('PENDING', 'PROCESSING');
 ```
 
-This allows users to keep any number of historical orders in terminal states while guaranteeing that only one active order exists at a time.
+This allows multiple active orders for the same user when their keys differ,
+and allows reusing a key after its previous order is terminal.
 
 Application-level validation may still be performed to provide a clearer API response, but PostgreSQL is responsible for enforcing the invariant under concurrent requests.
 
-If two concurrent requests attempt to create active orders for the same user, only one insert can succeed.
+If two concurrent requests attempt to create active orders with the same key,
+only one insert can succeed. Different keys do not conflict on user identity.
 
 ---
 
@@ -725,7 +750,14 @@ An order is persisted before its processing message is published to RabbitMQ.
 
 If publication temporarily fails, the API or publishing mechanism must retry the publication without creating a second order.
 
-The persisted order and its idempotency key remain the authoritative records for the logical order.
+The persisted order ID is the stable identity of a logical order. Its body-derived
+key can be reused by another order after completion, so it must not identify
+external payment side effects across distinct orders.
+
+Currently, publication failure is logged with `publicationRecoveryRequired`
+after persistence and the error is rethrown. Retrying the HTTP request returns
+409 while the order remains active and does not republish the event. An outbox
+or another publication recovery mechanism remains to be implemented.
 
 ---
 
@@ -916,11 +948,11 @@ The account has no `version` field. Each balance modification explicitly updates
 
 **Decision**
 
-PostgreSQL will enforce the one-active-order-per-user rule using:
+PostgreSQL enforces uniqueness of the idempotency key among active orders using:
 
 ```sql
-CREATE UNIQUE INDEX unique_active_order_per_user
-ON orders (user_id)
+CREATE UNIQUE INDEX unique_active_order_idempotency_key
+ON orders (idempotency_key)
 WHERE status IN ('PENDING', 'PROCESSING');
 ```
 
@@ -1065,20 +1097,21 @@ CREATE TABLE orders (
     status VARCHAR(20) NOT NULL,
     processing_step VARCHAR(50) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT now(),
-    updated_at TIMESTAMP NOT NULL DEFAULT now(),
-
-    CONSTRAINT unique_order_idempotency_key
-        UNIQUE (idempotency_key)
+    updated_at TIMESTAMP NOT NULL DEFAULT now()
 );
+
+CREATE UNIQUE INDEX unique_active_order_idempotency_key
+ON orders (idempotency_key)
+WHERE status IN ('PENDING', 'PROCESSING');
 ```
 
 The following business invariant must be enforced:
 
-> A user may have at most one order whose status is `PENDING` or `PROCESSING`.
+> An idempotency key may belong to at most one order whose status is `PENDING` or `PROCESSING`.
 
 ```sql
-CREATE UNIQUE INDEX unique_active_order_per_user
-ON orders (user_id)
+CREATE UNIQUE INDEX unique_active_order_idempotency_key
+ON orders (idempotency_key)
 WHERE status IN ('PENDING', 'PROCESSING');
 ```
 
@@ -1144,17 +1177,24 @@ in `scripts/sql/001-create-schema.sql`. Execution instructions are in
 `scripts/sql/README.md`. Keep `synchronize: false`: the Nest startup validator
 reports TypeORM schema differences without applying them.
 
+For an existing database with the former `unique_order_idempotency_key`
+constraint, apply `scripts/sql/002-active-order-idempotency.sql` once. It drops
+the global uniqueness constraint and creates the partial active-order index
+in a transaction without changing order records. Fresh databases initialized
+with the current `001-create-schema.sql` already have the partial idempotency
+index and must not run this upgrade. If an existing database also has
+`unique_active_order_per_user`, apply `003-remove-active-order-per-user.sql` to
+drop it without modifying order records. On the oldest schema, apply `002` and
+then `003`; fresh databases need neither. There is no automatic migration runner.
+
 # API Contract
 
 ## Create Order
 
 `POST /orders`
 
-Header:
-
-```http
-Idempotency-Key: order-create-abc123
-```
+The current endpoint generates its own body-derived idempotency key. No
+`Idempotency-Key` or `idempotencyId` request header is required or consumed.
 
 Request:
 
@@ -1172,9 +1212,12 @@ Request:
 The API must validate that:
 
 - the account exists;
-- the user is allowed to use the account;
-- the user does not already have an active order;
-- the idempotency key is valid.
+- the user is allowed to use the account (planned authorization requirement);
+- no identical order is currently active.
+
+The interceptor rejects the same body with 409 during its 10-second local TTL
+before the use case runs. Account existence and active-key checks are
+implemented; account ownership authorization remains planned.
 
 The definitive account-balance validation happens during asynchronous processing because the account balance may change between:
 
@@ -1186,24 +1229,19 @@ RabbitMQ
 Worker Processing
 ```
 
-Initial response:
+Current response (`201 Created`, Nest's default for this POST):
 
 ```json
 {
-  "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-  "accountId": "a27ac10b-84cc-4372-a567-0e02b2c3d111",
-  "status": "PENDING",
-  "processingStep": "PENDING_CREATED",
-  "amount": 120.50,
-  "currency": "USD"
+  "orderId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "status": "pending"
 }
 ```
 
-Suggested status:
+Response header: `X-Trace-Id: <generated UUID>`. Persisted statuses and processing
+steps are uppercase; this response currently uses lowercase `pending`.
 
-`202 Accepted`
-
-If the user already has an active order:
+If the body is within the local TTL or an identical order remains active:
 
 `409 Conflict`
 
@@ -1212,9 +1250,20 @@ Example:
 ```json
 {
   "statusCode": 409,
-  "message": "User already has an active order"
+  "message": "An identical request was recently received",
+  "error": "Conflict"
 }
 ```
+
+The domain conflict message is `An identical order is still being processed`,
+including conflicts detected by PostgreSQL during insertion. The global
+`InternalServiceErrorFilter` maps `CONFLICT` to Nest's `ConflictException` and
+`NOT_FOUND` to `NotFoundException`, preserving their messages. An unknown internal
+code returns a generic 500; existing Nest exceptions retain their responses.
+An account that does not exist returns 404 with `Provided account does not exist`.
+
+The following get, list, and cancel contracts are planned; only create-order is
+currently implemented.
 
 ---
 

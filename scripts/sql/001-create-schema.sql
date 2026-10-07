@@ -24,8 +24,6 @@ CREATE TABLE orders (
     created_at TIMESTAMP NOT NULL DEFAULT now(),
     updated_at TIMESTAMP NOT NULL DEFAULT now(),
 
-    CONSTRAINT unique_order_idempotency_key
-        UNIQUE (idempotency_key),
     CONSTRAINT fk_orders_account
         FOREIGN KEY (account_id) REFERENCES accounts(id),
     CONSTRAINT order_status_valid
@@ -47,8 +45,8 @@ CREATE TABLE orders (
         CHECK (split_part(processing_step, '_', 1) = status)
 );
 
-CREATE UNIQUE INDEX unique_active_order_per_user
-ON orders (user_id)
+CREATE UNIQUE INDEX unique_active_order_idempotency_key
+ON orders (idempotency_key)
 WHERE status IN ('PENDING', 'PROCESSING');
 
 COMMIT;

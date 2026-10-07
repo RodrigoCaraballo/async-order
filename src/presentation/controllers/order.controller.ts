@@ -1,4 +1,13 @@
-import { Body, Controller, Inject, Post, Headers } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Inject,
+  Post,
+  Req,
+  UseInterceptors,
+} from '@nestjs/common';
+import { CreateOrderInterceptor } from '../interceptors/create-order.interceptor';
+import type { OrderRequest } from '../interceptors/create-order.interceptor';
 import {
   CreateOrderDto,
   CreateOrderResponseDto,
@@ -14,13 +23,15 @@ export class OrderController {
   ) {}
 
   @Post()
+  @UseInterceptors(CreateOrderInterceptor)
   public async createOrder(
     @Body() createOrderDTO: CreateOrderDto,
-    @Headers('idempotencyId') idempotencyId: string,
+    @Req() request: OrderRequest,
   ): Promise<CreateOrderResponseDto> {
     const orderId = await this.createOrderUseCase.execute(
       mapToDomain(createOrderDTO),
-      idempotencyId,
+      request.idempotencyKey,
+      request.traceId,
     );
 
     return {

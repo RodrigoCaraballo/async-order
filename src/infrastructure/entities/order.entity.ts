@@ -38,7 +38,7 @@ import { AccountEntity } from './account.entity';
   'order_status_processing_step_consistent',
   `split_part("processing_step", '_', 1) = "status"`,
 )
-@Index('unique_active_order_per_user', ['userId'], {
+@Index('unique_active_order_idempotency_key', ['idempotencyKey'], {
   unique: true,
   where: "status IN ('PENDING', 'PROCESSING')",
 })
@@ -49,7 +49,6 @@ export class OrderEntity {
 
   @Column({
     name: 'idempotency_key',
-    unique: true,
     length: 255,
     nullable: false,
   })

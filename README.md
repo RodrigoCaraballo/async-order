@@ -2,7 +2,7 @@
 
 ## Overview
 Async Order is a backend service for managing orders that are processed asynchronously.
-A client can create an order, query its current state, list their orders, and cancel an order while it is still pending.
+Order creation is implemented. Querying, listing, cancellation, and worker processing remain part of the planned scope.
 The main goal of this project is to explore reliable asynchronous processing, database consistency, retries, concurrency, and idempotency in a backend system.
 
 ## Scope
@@ -36,7 +36,9 @@ Depending on the execution result, an order may also become:
 ## Architecture
 
 The API is responsible for accepting and validating requests and persisting the initial order state.
-Order processing is performed asynchronously through RabbitMQ workers.
+Order creation persists a `PENDING` order and publishes an `order.created` event
+with `{ orderId }` to RabbitMQ. Worker processing is planned; no worker is
+registered yet.
 
 Basic flow:
 
@@ -51,7 +53,7 @@ This project focuses on:
 - Asynchronous order processing.
 - Reliable message consumption.
 - Retry strategies.
-- Idempotent order creation.
+- Duplicate suppression during order creation and idempotent worker processing.
 - Concurrent worker execution.
 - Database transactions and consistency.
 - Failure handling.
@@ -62,6 +64,52 @@ This project focuses on:
 ### Create Order
 `POST /orders`
 
+```json
+{
+  "userId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "accountId": "a27ac10b-84cc-4372-a567-0e02b2c3d111",
+  "amount": 120.50,
+  "currency": "USD"
+}
+```
+
+No client idempotency header is required. `CreateOrderInterceptor` generates a
+SHA-256 `idempotencyKey` from the canonical JSON body and a fresh UUID `traceId`
+for each request. Object property order does not affect the hash; array order
+and body values do. The trace is returned as `X-Trace-Id` and passed to the use
+case for logging; it is not persisted or included in the RabbitMQ event.
+
+Successful creation returns HTTP `201 Created`:
+
+```json
+{ "orderId": "generated-order-uuid", "status": "pending" }
+```
+
+Persisted statuses and processing steps use uppercase values. The current
+creation response uses lowercase `pending`.
+
+Duplicate handling:
+
+- An identical body returns `409 Conflict` during a 10-second window from the
+  first accepted request. The interceptor uses a local `Map` with `setTimeout`;
+  duplicates do not extend the TTL, and failed requests retain their entry.
+- After the TTL, an identical `PENDING` or `PROCESSING` order still returns 409.
+  Different bodies may create multiple active orders for the same user.
+- An identical payment can be created again once the TTL expires and the previous
+  order is terminal, even if the user has other active orders.
+- A PostgreSQL partial unique index enforces active-key uniqueness across
+  instances. The Map is per instance and is lost on restart.
+
+This policy suppresses active duplicates; it does not replay the original
+response or guarantee permanent idempotency for retries after completion.
+If publication fails after persistence, the order remains active; retrying the
+HTTP request does not republish it. Publication recovery is still pending.
+
+The global `InternalServiceErrorFilter` maps `CONFLICT` to 409 and `NOT_FOUND`
+to 404, preserving domain messages. Unknown internal codes return a generic
+500. Existing Nest exceptions retain their behavior. PostgreSQL uniqueness
+violations for the active idempotency index are translated to domain conflicts.
+
 ### Get Order
 `GET /orders/:id`
 
@@ -70,6 +118,8 @@ This project focuses on:
 
 ### Cancel Order
 `POST /orders/:id/cancel`
+
+Get, list, and cancel endpoints above are planned contracts.
 
 ## Running Locally
 
@@ -83,6 +133,9 @@ Requirements:
 npm install
 cp .env.example .env
 docker compose up -d --wait
+# Initialize a fresh database before starting Nest (see scripts/sql/README.md).
+docker compose cp ./scripts/sql/001-create-schema.sql postgres:/tmp/001-create-schema.sql
+docker compose exec -T postgres psql -U async_order -d async_order -v ON_ERROR_STOP=1 -f /tmp/001-create-schema.sql
 npm run start:dev
 ```
 
@@ -100,7 +153,13 @@ precedence. `DATABASE_URL` and `RABBITMQ_URL` are required.
 
 `DatabaseModule` registers PostgreSQL and the order/account entities with
 `synchronize: false`: startup connects to PostgreSQL but does not create tables
-or indexes. Schema migrations are not configured yet.
+or indexes. There is no automatic migration runner; SQL scripts are applied
+manually. For a database using the old globally unique `idempotency_key`, apply
+`002-active-order-idempotency.sql` instead of rerunning the initial schema.
+If the database has `unique_active_order_per_user`, also apply
+`003-remove-active-order-per-user.sql` to allow different active orders for the
+same user. Fresh databases created with the current initial schema need neither
+upgrade script.
 
 `SchemaValidator` blocks startup if TypeORM proposes schema changes, without
 executing them. Initial SQL and setup instructions are in
